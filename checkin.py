@@ -987,6 +987,12 @@ class Config:
     ENV_COOKIES = "GLADOS_COOKIES"
     ENV_EXCHANGE_PLAN = "GLADOS_EXCHANGE_PLAN"
     ENV_VERBOSE = "GLADOS_VERBOSE"
+    ENV_EMAIL_HOST = "EMAIL_SMTP_HOST"
+    ENV_EMAIL_PORT = "EMAIL_SMTP_PORT"
+    ENV_EMAIL_USER = "EMAIL_USERNAME"
+    ENV_EMAIL_PASS = "EMAIL_PASSWORD"
+    ENV_EMAIL_TO = "EMAIL_TO"
+    ENV_EMAIL_FROM = "EMAIL_FROM"
 
     DEFAULT_EXCHANGE_PLAN = "none"
     DEFAULT_VERBOSE = False
@@ -995,6 +1001,7 @@ class Config:
         self.env = env if env is not None else os.environ
         self.push_key = ""
         self.serverchan_key = ""
+        self.email = None
         self.accounts = Accounts()
         self.exchange_plan = self.DEFAULT_EXCHANGE_PLAN
         self.verbose = self.DEFAULT_VERBOSE
@@ -1013,6 +1020,7 @@ class Config:
 
     def _load(self) -> None:
         self._load_push_keys()
+        self._load_email()
         # verbose 必须先加载：Accounts.parse 需要它来决定新建账号的 verbose 初值
         self._load_verbose()
         self._load_accounts()
@@ -1023,6 +1031,8 @@ class Config:
             logger.info(f"{LogEmoji.INFO} {LogEmoji.COOKIE}[{account.label}] {LogEmoji.DOMAIN}[{account.origin or '待探测'}] UA={'自定义' if account.user_agent else '默认'}")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_PUSH_KEY} {'已设置' if self.push_key else '未设置'}，" f"{self.ENV_SERVERCHAN_KEY} {'已设置' if self.serverchan_key else '未设置'}。")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_EXCHANGE_PLAN}: {self.exchange_plan}。")
+        email_desc = '未配置' if not self.email else '已配置 → ' + ', '.join(self.email['to'])
+        logger.info(f"{LogEmoji.INFO} 邮件通知：{email_desc}。")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_VERBOSE}: {self.verbose}。")
 
     def _get(self, key: str) -> str:
@@ -1034,6 +1044,26 @@ class Config:
             setattr(self, key, value)
             if not value:
                 logger.warning(f"{LogEmoji.WARNING} 环境变量 '{env_name}' 未设置。")
+
+    def _load_email(self) -> None:
+        """读取邮件通知配置；host 与 to 都填了才启用"""
+        host = self._get(self.ENV_EMAIL_HOST)
+        to_raw = self._get(self.ENV_EMAIL_TO)
+        if not host or not to_raw:
+            return
+        try:
+            port = int(self._get(self.ENV_EMAIL_PORT) or 465)
+        except ValueError:
+            logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_EMAIL_PORT}' 不是合法端口，已回退 465。")
+            port = 465
+        self.email = {
+            "host": host,
+            "port": port,
+            "user": self._get(self.ENV_EMAIL_USER),
+            "password": self._get(self.ENV_EMAIL_PASS),
+            "to": [x.strip() for x in re.split(r"[,;\s]+", to_raw) if x.strip()],
+            "from": self._get(self.ENV_EMAIL_FROM),
+        }
 
     def _load_accounts(self) -> None:
         raw = self._get(self.ENV_COOKIES)
@@ -1192,6 +1222,53 @@ class ServerChanBackend(PushBackend):
             return False
 
 
+class EmailBackend(PushBackend):
+    """SMTP 邮件后端：把签到结果发到指定邮箱"""
+
+    name = "Email"
+
+    def __init__(self, conf: Dict[str, Any]):
+        self.host = conf["host"]
+        self.port = conf["port"]
+        self.user = conf["user"]
+        self.password = conf["password"]
+        self.to = conf["to"]
+        self.mail_from = conf["from"] or conf["user"]
+
+    def _render(self, report: Report) -> str:
+        """邮件正文：每账号一行，字段之间只留一个空格"""
+        lines = report.render("\n").split("\n")
+        return "\n".join(re.sub(r" {2,}", " ", line).strip() for line in lines)
+
+    def send(self, report: Report) -> bool:
+        import smtplib
+        import ssl
+        from email.message import EmailMessage
+
+        msg = EmailMessage()
+        msg["Subject"] = report.title
+        msg["From"] = self.mail_from or "glados-checkin@localhost"
+        msg["To"] = ", ".join(self.to)
+        msg.set_content(self._render(report))
+
+        try:
+            ctx = ssl.create_default_context()
+            if self.port == 465:
+                server = smtplib.SMTP_SSL(self.host, self.port, timeout=30, context=ctx)
+            else:
+                server = smtplib.SMTP(self.host, self.port, timeout=30)
+                server.starttls(context=ctx)
+            with server:
+                if self.user:
+                    server.login(self.user, self.password)
+                server.send_message(msg)
+            logger.info(f"{LogEmoji.SUCCESS} [{self.name}] 已发送到 {msg['To']}")
+            return True
+        except Exception as e:  # noqa: BLE001 - 邮件失败不影响签到主流程
+            logger.error(f"{LogEmoji.ERROR} [{self.name}] 发送失败: {e}")
+            return False
+
+
 class PushService:
     """聚合多个推送后端，向全部已配置的后端发送（都发）"""
 
@@ -1203,6 +1280,8 @@ class PushService:
             self.backends.append(PushDeerBackend(config.push_key))
         if config.serverchan_key:
             self.backends.append(ServerChanBackend(config.serverchan_key))
+        if config.email:
+            self.backends.append(EmailBackend(config.email))
 
     def send(self, report: Report) -> bool:
         """向所有已配置后端发送，任一成功即视为成功"""
