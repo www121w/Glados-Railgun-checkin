@@ -67,6 +67,12 @@ jobs:
         EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
         EMAIL_TO: ${{ secrets.EMAIL_TO }}
         EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+        EDU_AUTO_RENEW: ${{ secrets.EDU_AUTO_RENEW }}
+        EDU_SMTP_HOST: ${{ secrets.EDU_SMTP_HOST }}
+        EDU_SMTP_PORT: ${{ secrets.EDU_SMTP_PORT }}
+        EDU_SMTP_USER: ${{ secrets.EDU_SMTP_USER }}
+        EDU_SMTP_PASS: ${{ secrets.EDU_SMTP_PASS }}
+        EDU_EMAIL: ${{ secrets.EDU_EMAIL }}
 
     # 签到失败（配置错误会 exit 1）时也要保活，否则恰好错过最需要提醒的那次
     - name: Keep alive
