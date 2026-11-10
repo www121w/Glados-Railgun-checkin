@@ -1,3 +1,4 @@
+import datetime
 import functools
 import hashlib
 import json
@@ -15,11 +16,179 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from logging_config import init_logger
+from logging_config import init_logger, BEIJING_TZ
 
 # --------------------------------------------------------------------------- #
 # 常量与枚举
 # --------------------------------------------------------------------------- #
+
+
+class EducationRenewer:
+    """GLaDOS 教育计划：状态播报 + 可自动续约（inbound 邮件验证）。
+
+    与签到积分兑换是两套独立机制。服务端 /api/user/education/status 返回
+    canRenew / nextRenewAt / used / cap / remaining / linkedEmail 等字段，
+    只有 canRenew=true 且开关开启、SMTP 配齐时才执行下面的三步：
+      1. POST /api/user/education/inbound          生成一次性验证地址
+      2. 从学校邮箱往该地址发一封邮件（SPF/DKIM 由服务端校验）
+      3. 轮询 GET /api/user/education/inbound/{token} 直到 ok / review / expired
+
+    任何异常都只记录状态、绝不影响签到主流程，也不让 Actions 变红。
+    """
+
+    def __init__(self, api: "API", config: "Config"):
+        self.api = api
+        self.config = config
+
+    def run(self) -> str:
+        """返回一行状态文本，并入该账号的报告行。"""
+        status = self._fetch_status()
+        if status is None:
+            return "教育计划: 状态查询失败"
+
+        code = status.get("code", -2)
+        if code != 0:
+            return f"教育计划: 查询失败(code={code})"
+
+        used = status.get("used")
+        cap = status.get("cap")
+        remaining = status.get("remaining")
+        can_renew = bool(status.get("canRenew"))
+        linked = status.get("linkedEmail") or status.get("email") or ""
+        next_at = self._fmt_ts(status.get("nextRenewAt"))
+
+        if not status.get("applied"):
+            return "教育计划: 未申请"
+
+        if status.get("remaining") is not None and cap and (remaining or 0) <= 0:
+            return f"教育计划: 已领满 {used}/{cap} 天"
+
+        base = f"教育计划: 已领 {used or 0}/{cap or 360} 天"
+        if not can_renew:
+            return f"{base} · 下次续约 {next_at}" if next_at else base
+
+        edu = self.config.education
+        if not edu or not edu.get("enabled"):
+            return f"{base} · 续约窗口已开放（自动续约关闭）"
+
+        if not all([edu.get("smtp_host"), edu.get("smtp_user"), edu.get("smtp_password"), edu.get("email")]):
+            return f"{base} · 续约窗口已开放（学校邮箱 SMTP 未配齐）"
+
+        result = self._renew(edu)
+        return f"{base} · {result}"
+
+    def _fetch_status(self) -> Optional[Dict]:
+        response = self.api.request("GET", APIEndpoint.EDU_STATUS, retry=False)
+        if response is None:
+            return None
+        try:
+            data = response.json()
+        except ValueError:
+            self.api.log(LogEmoji.WARNING, "教育计划状态响应解析失败", force=True)
+            return None
+        return data if isinstance(data, dict) else None
+
+    @staticmethod
+    def _fmt_ts(value: Any) -> str:
+        """毫秒时间戳 -> 北京时间 'YYYY-MM-DD HH:mm'；解析不了返回空串。"""
+        ms = to_int(value)
+        if ms is None:
+            return ""
+        try:
+            dt = datetime.datetime.fromtimestamp(ms / 1000, tz=BEIJING_TZ)
+            return dt.strftime("%Y-%m-%d %H:%M")
+        except (OverflowError, OSError, ValueError):
+            return ""
+
+    def _renew(self, edu: Dict[str, Any]) -> str:
+        """执行 inbound 三步；返回一行结果文本。"""
+        # 1. 生成验证地址（非幂等，禁用重试）
+        response = self.api.request("POST", APIEndpoint.EDU_INBOUND, retry=False)
+        if response is None:
+            return "续约: 验证地址创建失败"
+        try:
+            data = response.json()
+        except ValueError:
+            return "续约: 验证地址响应解析失败"
+        if not isinstance(data, dict) or data.get("code") != 0:
+            return f"续约: 验证地址创建被拒({data.get('message') if isinstance(data, dict) else '未知'})"
+
+        token, address = data.get("token"), data.get("address")
+        if not token or not address:
+            return "续约: 验证地址响应缺少 token/address"
+
+        # 2. 从学校邮箱发一封邮件到验证地址
+        sent, err = self._send_school_mail(edu, address, token)
+        if not sent:
+            return f"续约: 学校邮箱发信失败({err})"
+
+        # 3. 轮询验证结果
+        return self._poll_inbound(token)
+
+    @staticmethod
+    def _send_school_mail(edu: Dict[str, Any], address: str, token: str) -> Tuple[bool, str]:
+        """从学校邮箱发邮件到 GLaDOS 给的验证地址。SPF/DKIM 由收件方校验。"""
+        import smtplib
+        import ssl
+        from email.message import EmailMessage
+
+        host = edu["smtp_host"]
+        port = edu["smtp_port"]
+        user = edu["smtp_user"]
+        password = edu["smtp_password"]
+        from_addr = edu["email"]
+
+        msg = EmailMessage()
+        msg["Subject"] = "GLaDOS Education Verification"
+        msg["From"] = from_addr
+        msg["To"] = address
+        msg.set_content(
+            "Automated Education Pass renewal verification.\n"
+            f"Token: {token}\n"
+            "Sent from the linked school mailbox."
+        )
+
+        try:
+            ctx = ssl.create_default_context()
+            if port == 465:
+                server = smtplib.SMTP_SSL(host, port, timeout=30, context=ctx)
+            else:
+                server = smtplib.SMTP(host, port, timeout=30)
+                server.starttls(context=ctx)
+            with server:
+                server.login(user, password)
+                server.send_message(msg)
+            return True, ""
+        except Exception as e:  # noqa: BLE001 - 发信失败只需记录，不影响签到
+            return False, f"{type(e).__name__}: {e}"
+
+    def _poll_inbound(self, token: str) -> str:
+        """轮询 inbound 状态；pending 继续等，ok/review/expired/其他终态返回。"""
+        deadline = time.monotonic() + EDU_POLL_MAX_SECONDS
+        path = f"{APIEndpoint.EDU_INBOUND}/{token}"
+        while time.monotonic() < deadline:
+            response = self.api.request("GET", path, retry=False)
+            if response is None:
+                return "续约: 轮询请求失败"
+            try:
+                data = response.json()
+            except ValueError:
+                return "续约: 轮询响应解析失败"
+            if not isinstance(data, dict):
+                return "续约: 轮询响应格式异常"
+
+            state = data.get("status")
+            if state == "pending":
+                time.sleep(EDU_POLL_INTERVAL_SECONDS)
+                continue
+            if state == "ok":
+                return "续约成功: 教育计划已延期"
+            if state == "review":
+                return "续约: 已收邮件，需人工审核(1-3 天)"
+            if state == "expired":
+                return "续约: 验证地址已过期"
+            return f"续约: 未知状态({state})"
+        return "续约: 等待验证超时，请到站点确认"
 
 
 class CheckinStatus(Enum):
@@ -46,6 +215,8 @@ class APIEndpoint:
     STATUS = "/api/user/status"
     POINTS = "/api/user/points"
     EXCHANGE = "/api/user/exchange"
+    EDU_STATUS = "/api/user/education/status"
+    EDU_INBOUND = "/api/user/education/inbound"
 
 
 class LogEmoji:
@@ -90,6 +261,10 @@ MAX_LEFT_DAYS = 36500
 
 """剩余天数低于此值时在总结里提醒续期"""
 EXPIRY_WARN_DAYS = 7
+
+"""教育计划 inbound 验证：单次最长等待秒数 / 轮询间隔秒数"""
+EDU_POLL_MAX_SECONDS = 120
+EDU_POLL_INTERVAL_SECONDS = 3
 
 """积分查询超时（连接, 读取）。非关键请求且不重试；该接口实测 0.8~24s 波动较大，故放宽读取上限"""
 POINTS_TIMEOUT = (10, 30)
@@ -270,6 +445,7 @@ class CheckinResult:
     points_total: Optional[int] = None  # 账户总积分；None 表示未取到
     exchange: str = ""  # 仅在真正执行兑换时才有值，不含「未配置」这类配置状态
     note: str = ""  # 附加提示（如剩余天数偏少）
+    education: str = ""  # 教育计划状态播报 / 自动续约结果
     code: CheckinStatus = CheckinStatus.FAILURE
 
     @classmethod
@@ -375,6 +551,7 @@ class CookieEntry:
             self.log(domain, LogEmoji.INFO, "签到未成功，跳过自动兑换")
 
         result.note = self._expiry_note(result.days)
+        result.education = EducationRenewer(api, config).run()
         return result
 
     def _apply_exchange(self, api: "API", config: "Config", domain: str) -> str:
@@ -993,6 +1170,12 @@ class Config:
     ENV_EMAIL_PASS = "EMAIL_PASSWORD"
     ENV_EMAIL_TO = "EMAIL_TO"
     ENV_EMAIL_FROM = "EMAIL_FROM"
+    ENV_EDU_AUTO_RENEW = "EDU_AUTO_RENEW"
+    ENV_EDU_SMTP_HOST = "EDU_SMTP_HOST"
+    ENV_EDU_SMTP_PORT = "EDU_SMTP_PORT"
+    ENV_EDU_SMTP_USER = "EDU_SMTP_USER"
+    ENV_EDU_SMTP_PASS = "EDU_SMTP_PASS"
+    ENV_EDU_EMAIL = "EDU_EMAIL"
 
     DEFAULT_EXCHANGE_PLAN = "none"
     DEFAULT_VERBOSE = False
@@ -1002,6 +1185,7 @@ class Config:
         self.push_key = ""
         self.serverchan_key = ""
         self.email = None
+        self.education = None
         self.accounts = Accounts()
         self.exchange_plan = self.DEFAULT_EXCHANGE_PLAN
         self.verbose = self.DEFAULT_VERBOSE
@@ -1021,6 +1205,7 @@ class Config:
     def _load(self) -> None:
         self._load_push_keys()
         self._load_email()
+        self._load_education()
         # verbose 必须先加载：Accounts.parse 需要它来决定新建账号的 verbose 初值
         self._load_verbose()
         self._load_accounts()
@@ -1033,6 +1218,8 @@ class Config:
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_EXCHANGE_PLAN}: {self.exchange_plan}。")
         email_desc = '未配置' if not self.email else '已配置 → ' + ', '.join(self.email['to'])
         logger.info(f"{LogEmoji.INFO} 邮件通知：{email_desc}。")
+        edu_desc = '开启' if (self.education and self.education['enabled']) else '关闭（仅状态播报）'
+        logger.info(f"{LogEmoji.INFO} 教育计划自动续约：{edu_desc}。")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_VERBOSE}: {self.verbose}。")
 
     def _get(self, key: str) -> str:
@@ -1063,6 +1250,28 @@ class Config:
             "password": self._get(self.ENV_EMAIL_PASS),
             "to": [x.strip() for x in re.split(r"[,;\s]+", to_raw) if x.strip()],
             "from": self._get(self.ENV_EMAIL_FROM),
+        }
+
+    def _load_education(self) -> None:
+        """教育计划：状态播报始终开启；自动续约需开关 + 学校邮箱 SMTP。
+
+        EDU_AUTO_RENEW 未配置或显式真值 => 开启；显式 false/0/no => 关闭。
+        真要执行发信还受服务端 canRenew 与 SMTP 配置双重把关。
+        """
+        raw = self._get(self.ENV_EDU_AUTO_RENEW).lower()
+        enabled = raw not in FALSY
+        try:
+            port = int(self._get(self.ENV_EDU_SMTP_PORT) or 465)
+        except ValueError:
+            logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_EDU_SMTP_PORT}' 不是合法端口，已回退 465。")
+            port = 465
+        self.education = {
+            "enabled": enabled,
+            "smtp_host": self._get(self.ENV_EDU_SMTP_HOST),
+            "smtp_port": port,
+            "smtp_user": self._get(self.ENV_EDU_SMTP_USER),
+            "smtp_password": self._get(self.ENV_EDU_SMTP_PASS),
+            "email": self._get(self.ENV_EDU_EMAIL),
         }
 
     def _load_accounts(self) -> None:
@@ -1145,6 +1354,8 @@ class Report:
             )
             if r.exchange:
                 line += f" · {r.exchange}"
+            if r.education:
+                line += f" · {r.education}"
             if r.note:
                 line += f"  ⚠️ {r.note}"
             lines.append(line)
