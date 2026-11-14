@@ -269,6 +269,9 @@ EDU_POLL_INTERVAL_SECONDS = 3
 """Cloudflare Turnstile 人机验证被拒(code=5)时的自动重试间隔秒数（服务端提示 please retry）"""
 TURNSTILE_RETRY_DELAYS = (45, 90)
 
+"""兑换进度预估用的每日积分收入（free cap max 2，仅用于报告估算）"""
+EXCHANGE_DAILY_INCOME = 2
+
 """积分查询超时（连接, 读取）。非关键请求且不重试；该接口实测 0.8~24s 波动较大，故放宽读取上限"""
 POINTS_TIMEOUT = (10, 30)
 
@@ -561,7 +564,7 @@ class CookieEntry:
 
         # 签到没成功就去兑换，只会白花积分或再吃一次拒绝，故仅成功/重复时兑换
         if result.code in (CheckinStatus.SUCCESS, CheckinStatus.REPEAT):
-            result.exchange = self._apply_exchange(api, config, domain)
+            result.exchange = self._apply_exchange(api, config, domain, result.points_total)
         else:
             self.log(domain, LogEmoji.INFO, "签到未成功，跳过自动兑换")
 
@@ -572,12 +575,22 @@ class CookieEntry:
         result.education = EducationRenewer(api, config).run()
         return result
 
-    def _apply_exchange(self, api: "API", config: "Config", domain: str) -> str:
-        """按配置执行兑换；未配置时返回空串（配置状态不进推送正文）"""
+    def _apply_exchange(self, api: "API", config: "Config", domain: str, points_total: Optional[int] = None) -> str:
+        """按配置执行兑换；未配置时返回空串（配置状态不进推送正文）。
+
+        积分不足时不发兑换请求（避免每次白吃一次拒绝），改为播报攒分进度。
+        """
         required = config.exchange_plans.get(config.exchange_plan)
         if required is None:
             self.log(domain, LogEmoji.INFO, "未配置兑换计划，跳过自动兑换")
             return ""
+
+        if points_total is not None and points_total < required:
+            gap = required - int(points_total)
+            # 按 free cap 2 分/天保守估算；实际签到收入波动，仅供参考
+            est_days = (gap + EXCHANGE_DAILY_INCOME - 1) // EXCHANGE_DAILY_INCOME
+            self.log(domain, LogEmoji.INFO, f"积分不足({points_total}/{required})，约 {est_days} 天后可兑换")
+            return f"距 {config.exchange_plan} 还差 {gap} 分(约 {est_days} 天)"
 
         self.log(domain, LogEmoji.EXCHANGE, f"开始兑换 {config.exchange_plan} (需要 {required} 积分)")
         return api.exchange(config.exchange_plan)
