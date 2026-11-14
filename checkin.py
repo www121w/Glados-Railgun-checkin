@@ -266,6 +266,9 @@ EXPIRY_WARN_DAYS = 7
 EDU_POLL_MAX_SECONDS = 120
 EDU_POLL_INTERVAL_SECONDS = 3
 
+"""Cloudflare Turnstile 人机验证被拒(code=5)时的自动重试间隔秒数（服务端提示 please retry）"""
+TURNSTILE_RETRY_DELAYS = (45, 90)
+
 """积分查询超时（连接, 读取）。非关键请求且不重试；该接口实测 0.8~24s 波动较大，故放宽读取上限"""
 POINTS_TIMEOUT = (10, 30)
 
@@ -446,6 +449,7 @@ class CheckinResult:
     exchange: str = ""  # 仅在真正执行兑换时才有值，不含「未配置」这类配置状态
     note: str = ""  # 附加提示（如剩余天数偏少）
     education: str = ""  # 教育计划状态播报 / 自动续约结果
+    need_manual: bool = False  # 需人工验证(turnstile)：自动签到被拒，需手动点验证
     code: CheckinStatus = CheckinStatus.FAILURE
 
     @classmethod
@@ -541,6 +545,17 @@ class CookieEntry:
         result.domain = domain
         result.days = days
 
+        # 服务端对人机验证拒绝明确提示 please retry(retryable)：按间隔自动重试；
+        # 每次重试 api.checkin() 内部都会重新取 challenge，不会复用旧验证
+        for delay in TURNSTILE_RETRY_DELAYS:
+            if not result.need_manual:
+                break
+            self.log(domain, LogEmoji.WARNING, f"人机验证被拒，{delay}s 后自动重试（服务端 please retry）", force=True)
+            time.sleep(delay)
+            result = api.checkin()
+            result.domain = domain
+            result.days = days
+
         self.log(domain, LogEmoji.POINTS, "查询总积分")
         result.points_total = api.get_points()
 
@@ -550,7 +565,10 @@ class CookieEntry:
         else:
             self.log(domain, LogEmoji.INFO, "签到未成功，跳过自动兑换")
 
-        result.note = self._expiry_note(result.days)
+        expiry = self._expiry_note(result.days)
+        manual = ("Cloudflare 人机验证未通过，今日需手动签到: https://glados.cloud/console/checkin"
+                  if result.need_manual else "")
+        result.note = "；".join(x for x in (manual, expiry) if x)
         result.education = EducationRenewer(api, config).run()
         return result
 
@@ -834,6 +852,13 @@ def log_reject(code: int, raw: Dict, message: str, domain: str, log: Callable[..
             log(LogEmoji.ERROR, f"服务端拒绝签到(code=4, reason={raw.get('reason')})，请检查账户风控状态", True)
         if ua_hint:
             log(LogEmoji.INFO, f"建议：{ua_hint}", True)
+    elif code == 5 or raw.get("reason") == "turnstile":
+        log(
+            LogEmoji.ERROR,
+            f"签到需人机验证(code=5, reason={raw.get('reason')})：服务端 Cloudflare Turnstile 拦截，"
+            f"提示 please retry；脚本将自动重试，仍失败则今日需手动签到",
+            True,
+        )
     elif code == -2:
         log(
             LogEmoji.ERROR,
@@ -871,6 +896,8 @@ def parse_checkin(raw: Optional[Dict], domain: str, log: Callable[..., None], ua
         result.code = CheckinStatus.REPEAT
     else:
         log_reject(code, raw, message, domain, log, ua_hint)
+        if code == 5 or raw.get("reason") == "turnstile":
+            result.need_manual = True
     return result
 
 
