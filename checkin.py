@@ -1486,21 +1486,39 @@ class EmailBackend(PushBackend):
         self.to = conf["to"]
         self.mail_from = conf["from"] or conf["user"]
 
+    @staticmethod
+    def _edu_summary(report: Report) -> Tuple[str, str]:
+        """只提取教育计划状态；返回 (标题后缀, 正文)。"""
+        edu_lines = [e.result.education for e in report.entries if e.result.education]
+        body = "\n".join(edu_lines) if edu_lines else "教育计划: 状态未知"
+        joined = " ".join(edu_lines)
+        if "续约成功" in joined:
+            status = "续约成功"
+        elif "人工审核" in joined:
+            status = "待审核"
+        elif "续约" in joined and ("失败" in joined or "超时" in joined):
+            status = "续约失败"
+        elif "下次续约" in joined:
+            status = "待续约"
+        else:
+            status = "状态"
+        return status, body
+
     def _render(self, report: Report) -> str:
-        """邮件正文：每账号一行，字段之间只留一个空格"""
-        lines = report.render("\n").split("\n")
-        return "\n".join(re.sub(r" {2,}", " ", line).strip() for line in lines)
+        """邮件正文：只报教育计划续约状态"""
+        return self._edu_summary(report)[1]
 
     def send(self, report: Report) -> bool:
         import smtplib
         import ssl
         from email.message import EmailMessage
 
+        status, body = self._edu_summary(report)
         msg = EmailMessage()
-        msg["Subject"] = report.title
+        msg["Subject"] = f"教育续约 · {status}"
         msg["From"] = self.mail_from or "glados-checkin@localhost"
         msg["To"] = ", ".join(self.to)
-        msg.set_content(self._render(report))
+        msg.set_content(body)
 
         try:
             ctx = ssl.create_default_context()
