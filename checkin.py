@@ -1508,12 +1508,21 @@ class EmailBackend(PushBackend):
         """邮件正文：只报教育计划续约状态"""
         return self._edu_summary(report)[1]
 
+    @staticmethod
+    def _should_send(report: Report) -> bool:
+        """只有教育续约实际执行过（成功/失败/待审核）才发邮件，平时不打扰"""
+        status, _ = EmailBackend._edu_summary(report)
+        return status in ("续约成功", "续约失败", "待审核")
+
     def send(self, report: Report) -> bool:
         import smtplib
         import ssl
         from email.message import EmailMessage
 
         status, body = self._edu_summary(report)
+        if not self._should_send(report):
+            logger.info(f"{LogEmoji.INFO} 教育续约未执行（{status}），跳过邮件推送")
+            return False
         msg = EmailMessage()
         msg["Subject"] = f"教育续约 · {status}"
         msg["From"] = self.mail_from or "glados-checkin@localhost"
